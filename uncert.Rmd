@@ -1,0 +1,219 @@
+---
+title: "Uncertainty Propagation"
+author: "Philip Dixon"
+date: "10 November 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Goal, in pictures:
+
+Have spatial data on Soil OC and Soil N.  Some locations have both; other locations have one or the other.  Kriging gives you spatial predictions of OC and N, with location-specific uncertainties.
+
+```{r, warning=FALSE, message=FALSE}
+library(spup)    # key package: SPatial Uncertainty Propagation
+library(raster)  # raster graphics
+library(purrr)   # library with similar functionality to dplyr
+
+data(OC, OC_sd, TN, TN_sd)
+par(mfrow=c(2,2), mar=c(3,3,0,0)+0.2, mgp=c(2,0.8,0))
+plot(OC); legend('top', bty='n', legend='mean C', inset=-0.05)
+plot(OC_sd); legend('top', bty='n', legend='sd C', inset=-0.05)
+plot(TN); legend('top', bty='n', legend='mean total N', inset=-0.05)
+plot(TN_sd); legend('top', bty='n', legend='sd total N', inset=-0.05)
+```
+
+You want a derived quantity: e.g., C/N ratio with its uncertainty.  Would like to see this information two ways: 1) maps of C/N and 2) estimated area with C/N > 20.  Want uncertainty for each (se or quantiles of the distribution).
+
+Map of C/N is easy from the raster images.  Operations on rasters produce rasters.
+```{r}
+CN <- OC/TN
+par(mfrow=c(1,1))
+plot(CN); legend('top', bty='n', legend='Estimated C/N', inset=-0.05)
+```
+But what is the uncertainty?  Complicated here because
+
+* quantity is a non-linear function of data
+* OC and TN values are each spatially correlated
+* OC and TN are cross-correlated (i.e, at same location)
+
+spup library provides uncertainty distributions quantiles and summaries, like sd of estimates.  Uses Monte-Carlo simulation.
+
+## Simpler problems: uncertainty propagation
+
+Large engineering literature.  Methods codified in 
+Evaluation of measurement data - Guide to the expression of uncertainty in measurement.
+JCGM 100:2008 (GUM 1995 with minor corrections).
+http://www.bipm.org/utils/common/documents/jcgm/JCGM_100_2008_E.pdf and 
+Evaluation of measurement data - Supplement 1 to the Guide to the expression of uncertainty in
+measurement - Propagation of distributions using a Monte Carlo Method.
+JCGM 101:2008.
+http://www.bipm.org/utils/common/documents/jcgm/JCGM_101_2008_E.pdf
+.
+
+### Meat pH data
+```{r}
+meat <- data.frame(
+  time = rep(c(1,2,4,6,8), rep(2,5)),
+  pH = c(7.02, 6.93, 6.42, 6.51, 6.07, 5.99, 
+    5.59, 5.80, 5.51, 5.36)
+  )
+meat$logtime <- log(meat$time)
+with(meat, plot(logtime, pH, pch=19, col=4) )
+meat.lm <- lm(pH ~ logtime, data=meat)
+coef(meat.lm)
+abline(coef(meat.lm))
+abline(h=5.7, lty=3)
+```
+
+At what time does mean pH drop to 5.7?  $$\hat{\log T_{5.7}} = \frac{5.7 - 6.983}{-0.7256} = 1.769$$.  Estimated time = $\exp 1.769$ = 5.86 hours.
+
+How uncertain is this estimate?  Various ways to provide this.
+
+* non-parametric bootstrap: resample the observations.  Needs some care here because not a simple random sample (Times are not random).  Could use bootstrap the residuals
+* parametric bootstrap of coefficients: Resample $\beta_0$ and $\beta_1$ from their joint distribution.
+* approximation methods: turn non-linear function into a 1st (linear) or 2nd (quadratic) order approximating function.
+
+boot and bootstrap libraries implement the bootstraps.  I prefer boot, because I find it easy to use and it provides lots of different variations.  My go-to method for non-parametric bootstraps.  Could also use it for the parametric bootstrap.
+
+propagate library implements the parametric bootstrap and the approximation methods.  
+
+The parametric bootstrap, by hand:
+```{r}
+library(mvtnorm)
+mub <- coef(meat.lm)   # estimates => mean parameter values
+vcb <- vcov(meat.lm)   # variance-covariance matrix
+rb <- rmvnorm(1000, mean=mub, sigma=vcb)
+head(rb)
+b0 <- rb[,1]
+b1 <- rb[,2]
+estT <- exp((5.7 - b0)/b1)
+hist(estT, main='')
+sd(estT)
+# se of estimate, log Time scale
+exp(quantile(estT, c(0.025, 0.975)))
+# percentile bootstrap 95% CI for Time
+```
+Or can use propagate().  Can provide either the data (type='raw'), means and sd's (type='stat') or random samples (type='sim'). Type = 'stat' appears to only generate independent random samples.  Slope and intercept estimates are correlated, so use type='sim' and the matrix of correlated estimates.
+
+Required arguments are an expression for the quantity of interest, the data, and its type. Column names in the data must match variable names in the expression. 
+```{r, warning=FALSE, message=FALSE}
+library(propagate)
+dimnames(rb)[[2]] <- c('b0','b1')
+# set column names so we propagate() knows what we are talking about
+That <- expression(exp((5.7-b0)/b1))
+estTp <- propagate(expr=That, data=rb, type='sim',  nsim=100000)
+estTp
+```
+Error propagation results are for two types of approximations: linear (the .1) and quadratic (the .2) and using Monte-Carlo simulation (here the 1000 samples).  Since the Monte-Carlo estimates are derived from the samples (b0, b1) we provided, they are the same.
+
+The approximate method only require means and variances, not distributions.  Monte-Carlo simulation requires distributions.
+
+## Spatial uncertainty
+The concepts of uncertainty propagation carry over to the spatial domain, but the details get more complicated.  The spup library implements the Monte-Carlo simulation approach. The following is heavily based on the C/N vignette for the spup package.  
+
+The basic steps are the same as before:
+
+* Simulate random values of the uncertain variables
+* Compute the quantity of interest for each random realization
+* and tabulate summaries (mean, sd, whatever)
+
+The data, shown above, are organic C and total N measurements in soil samples from a part of Madagascar.  These data have spatial correlation for each variable and have a cross-correlation between variables.  These patterns can be estimated by fitting variograms and cross-variograms (see Stat 406 next semester).
+
+So, the steps will be (first four are new because spatial data are more complicated):
+
+* describe the spatial correlation pattern for each variable
+* provide maps of the mean and sd for each variable
+* describe the spatial correlation between variables
+* simulate random maps for both variables
+* compute the quantity of interest for each random map
+* tabulate and summarize
+
+Variogram analysis suggests that a C is described by an isotropic Spherical variogram with nugget = 40% of the sill and a range of 5000m.  N is described similarly with a nugget of 60% of the sill.  These are described to spup as correlation models; the acf0 parameter is the correlation at short range = 1-nugget proportion.  The makecrm() function accepts most variogram models supported by vgm() in the gstat library (Exp, Sph, Gau, Mat).  Since we will also model the cross-correlation between C and N, we need the same variogram model and same range for both C and N.  That's because spup (and gstat) use the linear coregionalization model, which requires that.  
+
+```{r}
+library(spup)
+# describe the spatial correlation for each variable
+Ccrm <- makecrm(acf0 = 0.6, range = 5000, model = "Sph")
+Ncrm <- makecrm(acf0 = 0.4, range = 5000, model = "Sph")
+par(mfrow=c(1,2), mar=c(3,3,0,0)+0.2, mgp=c(2,0.8,0))
+plot(Ccrm); legend('top', bty='n', legend='C')
+plot(Ncrm); legend('top', bty='n', legend='N')
+```
+
+Use defineUM()  (Uncertainty Model) to combine the spatial correlation with maps of mean and sd for each variable.  You  can also define non-random spatial variables, if something involved in the calculation is considered known without error.  
+
+The first argument is TRUE when this variable is random and FALSE if fixed.  Then come the distribution, the mean and variance, the correlogram model, and an identifier.  The identifier is used in the next step to define the joint distribution of C and N.  spup supports all sorts of distributions for non-spatially correlated variables.  If spatially correlated, you're talking normal only.
+```{r}
+Cum <- defineUM(TRUE, distribution = "norm", distr_param = c(OC, OC_sd), crm = Ccrm, id = "OC")
+Num <- defineUM(TRUE, distribution = "norm", distr_param = c(TN, TN_sd), crm = Ncrm, id = "TN")
+```
+
+Since C and N are cross-correlated, define the multivariate model.  Previous analysis indicates the cross-correlation at the same location is 0.7.
+
+```{r}
+CNum <- defineMUM(UMlist = list(Cum, Num), 
+  cormatrix = matrix(c(1,0.7,0.7,1), nrow=2, ncol=2))
+```
+
+Now we can have fun!  To generate random realizations of each variable, use the genSample() function.  For spatially correlated variables, this uses the unconditional Gaussian sample algorithm implemented in the gstat library.  Arguments are the MUM object, the number of samples, the method, and a gstat argument that limits the number of spatial neighbors used in the conditioning set  (20 is usually just fine).  asList=F returns the results as a RasterStack, which the raster library plots and computes with very nicely.  If T, you get a list containing the samples.  Here we generate 2 samples and plot them:
+
+```{r}
+CNrand2 <- genSample(UMobject = CNum, n = 2, samplemethod = "ugs", nmax = 20, asList = FALSE)
+plot(CNrand2)
+```
+
+To combine all sources of uncertainty (here in the C map and in the N map), we need to write a function that defines the computation we want.  The variable names in the function match the id's specified in the defineUM().  
+
+```{r}
+CNratio <- function(OC, TN) {
+  OC/TN
+}
+```
+
+Then we use the spup version of propagate().  Same name as propagate() in the propagate library!  Arguments are different, so if you load the wrong one, or the search() list is in the wrong order, you get an error.  
+
+The other gotcha is that propagate() wants the random samples as a list of lists, not a rasterStack.  Can coerce to a list or rerun genSample() with asList=T.  Since I want more than 2 random samples, I will rerun genSample().  For real use, would want 1000 or more random samples, but the actual number depends on what you want to estimate.  More for extreme quantiles, less for an average.
+
+Arguments for propagate() are the list of realizations of all random variables, the function to compute our result, and the number of Monte-Carlo samples.  This is $\leq$ the number of realizations.
+
+```{r}
+library(spup)
+Nmc <- 100
+CNrand100 <- genSample(UMobject = CNum, n = Nmc, samplemethod = "ugs",  
+  nmax = 20, asList = T)
+ratiorand <- spup::propagate(realizations=CNrand100, model=CNratio, n=Nmc)
+```
+
+Can view each map of CN ratio by converting the list from propagate to a rasterStack.  names() just gives each raster a name.  Here we view the first 4.  
+
+```{r}
+ratio <- stack(ratiorand)
+names(ratio) <- paste("CNratio", 1:nlayers(ratio), sep='.')
+par(mfrow=c(1,1))
+plot(ratio[[1:4]])
+```
+
+Can use raster functions to compute summary statistics over the maps.
+mean() is predefined.  Other functions need to be embedded in calc().
+
+```{r}
+ratiomean <- mean(ratio)
+ratiosd <- calc(ratio, fun=sd)
+par(mfrow=c(1,2))
+plot(ratiomean, main='Mean C/N ratio')
+plot(ratiosd, main='sd of C/N ratio')
+```
+
+And can extract other features by manipulating the rasters.  For example, count the number of raster cells with C/N ratio larger than 20.  Easiest to operate on the list of realizations.
+```{r}
+bigCN <- function(r) {
+  sum(as.matrix(r) > 20, na.rm=T)
+}
+bigratio <- sapply(ratiorand, bigCN)
+hist(bigratio, main='', xlab='Number of cells with c/N > 20')
+```
+
